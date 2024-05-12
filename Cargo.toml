@@ -6,3 +6,6 @@ edition = "2021"
 [dependencies.serenity]
 version = "0.12.1"
 features = ["cache", "framework", "standard_framework", "voice"]
+
+[dependencies]
+tokio = { version = "1.21.2", features = ["macros", "rt-multi-thread"] }
