@@ -7,7 +7,7 @@ use serenity::framework::standard::{Args, CommandResult, Configuration};
 use serenity::framework::standard::macros::{command, group};
 use serenity::prelude::*;
 use songbird::{EventContext, SerenityInit, TrackEvent};
-use songbird::input::YoutubeDl;
+use songbird::input::{Compose, YoutubeDl};
 
 // see https://github.com/serenity-rs/serenity/blob/current/examples/e01_basic_ping_bot/src/main.rs
 // see https://github.com/serenity-rs/songbird/blob/current/examples/serenity/voice/src/main.rs
@@ -16,7 +16,7 @@ use songbird::input::YoutubeDl;
 async fn main() {
     let token = env::var("DMBOT_TOKEN").expect("Expected a token in the environment");
 
-    let framework = StandardFramework::new().group(&GENERAL_GROUP);
+    let framework = StandardFramework::new().group(&DMBOT_GROUP);
     framework.configure(Configuration::new().prefix("!"));
 
     let intents = GatewayIntents::non_privileged() | GatewayIntents::MESSAGE_CONTENT;
@@ -34,6 +34,7 @@ async fn main() {
     }
 }
 
+/// Key to access the client stored in the type map. The client is used to play YouTube tracks.
 struct HttpKey;
 
 impl TypeMapKey for HttpKey {
@@ -52,6 +53,7 @@ impl EventHandler for Handler {
 
 struct TrackErrorNotifier;
 
+/// processes errors which might occur when playing music tracks with songbird
 #[async_trait]
 impl songbird::events::EventHandler for TrackErrorNotifier {
     async fn act(&self, ctx: &EventContext<'_>) -> Option<songbird::Event> {
@@ -71,44 +73,40 @@ impl songbird::events::EventHandler for TrackErrorNotifier {
 
 /// All commands the bot supports
 #[group]
-#[commands(hello, join, leave, play)]
-struct General;
+#[commands(play)]
+struct DMBot;
 
+/// Main command which is used to join a channel and play some music from YouTube.
 #[command]
 #[only_in(guilds)]
-async fn hello(
-    ctx: &Context,
-    message: &Message
+async fn play(
+    context: &Context,
+    message: &Message,
+    mut args: Args,
 ) -> CommandResult {
-    check_msg(message.reply(ctx, "hello").await);
-    Ok(())
-}
+    let url = match args.single::<String>() {
+        Ok(url) => url,
+        Err(_) => {
+            check_msg(
+                message.channel_id
+                    .say(&context.http, "Must provide a URL to a video or audio")
+                    .await,
+            );
 
-#[command]
-#[only_in(guilds)]
-async fn join(
-    ctx: &Context,
-    message: &Message
-) -> CommandResult {
-    let (guild_id, channel_id) = {
-        let guild = message.guild(&ctx.cache).unwrap();
-        let channel_id = guild
-            .voice_states
-            .get(&message.author.id)
-            .and_then(|voice_state| voice_state.channel_id);
-
-        (guild.id, channel_id)
+            return Ok(());
+        }
     };
 
+    let (guild_id, channel_id) = get_guild_and_voice_channel(context, message);
     let connect_to = match channel_id {
         Some(channel) => channel,
         None => {
-            check_msg(message.reply(ctx, "Not in a voice channel").await);
+            check_msg(message.reply(context, "Not in a voice channel").await);
             return Ok(());
-        },
+        }
     };
 
-    let manager = songbird::get(&ctx)
+    let manager = songbird::get(&context)
         .await
         .expect("Songbird Voice client placed in at initialisation.")
         .clone();
@@ -119,87 +117,40 @@ async fn join(
         handler.add_global_event(TrackEvent::Error.into(), TrackErrorNotifier);
     }
 
-    Ok(())
-}
-
-#[command]
-#[only_in(guilds)]
-async fn leave(ctx: &Context, msg: &Message) -> CommandResult {
-    let guild_id = msg.guild_id.unwrap();
-
-    let manager = songbird::get(ctx)
-        .await
-        .expect("Songbird Voice client placed in at initialisation.")
-        .clone();
-    let has_handler = manager.get(guild_id).is_some();
-
-    if has_handler {
-        if let Err(e) = manager.remove(guild_id).await {
-            check_msg(
-                msg.channel_id
-                    .say(&ctx.http, format!("Failed: {:?}", e))
-                    .await,
-            );
-        }
-
-        check_msg(msg.channel_id.say(&ctx.http, "Left voice channel").await);
-    } else {
-        check_msg(msg.reply(ctx, "Not in a voice channel").await);
-    }
-
-    Ok(())
-}
-
-#[command]
-#[only_in(guilds)]
-async fn play(
-    ctx: &Context,
-    msg: &Message,
-    mut args: Args
-) -> CommandResult {
-    let url = match args.single::<String>() {
-        Ok(url) => url,
-        Err(_) => {
-            check_msg(
-                msg.channel_id
-                    .say(&ctx.http, "Must provide a URL to a video or audio")
-                    .await,
-            );
-
-            return Ok(());
-        },
-    };
-
-    let guild_id = msg.guild_id.unwrap();
-
     let http_client = {
-        let data = ctx.data.read().await;
+        let data = context.data.read().await;
         data.get::<HttpKey>()
             .cloned()
-            .expect("Guaranteed to exist in the typemap.")
+            .expect("The HTTP client should exist in the type map.")
     };
-
-    let manager = songbird::get(ctx)
-        .await
-        .expect("Songbird Voice client placed in at initialisation.")
-        .clone();
 
     if let Some(handler_lock) = manager.get(guild_id) {
         let mut handler = handler_lock.lock().await;
 
         let mut src = YoutubeDl::new(http_client, url);
         let _ = handler.play_input(src.clone().into());
+        let title = src.aux_metadata().await.unwrap().title.unwrap();
 
-        check_msg(msg.channel_id.say(&ctx.http, "Playing song").await);
+        check_msg(message.channel_id.say(&context.http, format!("Playing '{title}'")).await);
     } else {
         check_msg(
-            msg.channel_id
-                .say(&ctx.http, "Not in a voice channel to play in")
+            message.channel_id
+                .say(&context.http, "Not in a voice channel to play in")
                 .await,
         );
     }
 
     Ok(())
+}
+
+fn get_guild_and_voice_channel(context: &Context, message: &Message) -> (GuildId, Option<ChannelId>) {
+    let guild = message.guild(&context.cache).unwrap();
+    let channel_id = guild
+        .voice_states
+        .get(&message.author.id)
+        .and_then(|voice_state| voice_state.channel_id);
+
+    (guild.id, channel_id)
 }
 
 /// Checks that a message successfully sent; if not, then logs why to stdout.
