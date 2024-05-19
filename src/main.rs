@@ -73,7 +73,7 @@ impl songbird::events::EventHandler for TrackErrorNotifier {
 
 /// All commands the bot supports
 #[group]
-#[commands(play)]
+#[commands(play, skip, stop, help)]
 struct DMBot;
 
 /// Main command which is used to join a channel and play some music from YouTube.
@@ -128,10 +128,12 @@ async fn play(
         let mut handler = handler_lock.lock().await;
 
         let mut src = YoutubeDl::new(http_client, url);
-        let _ = handler.play_input(src.clone().into());
+        let _ = handler.enqueue_input(src.clone().into()).await;
+
+        let queue_position = handler.queue().len();
         let title = src.aux_metadata().await.unwrap().title.unwrap();
 
-        check_msg(message.channel_id.say(&context.http, format!("Playing '{title}'")).await);
+        check_msg(message.channel_id.say(&context.http, format!("Added '{title}' in queue position {queue_position}")).await);
     } else {
         check_msg(
             message.channel_id
@@ -140,6 +142,90 @@ async fn play(
         );
     }
 
+    Ok(())
+}
+
+/// stop the current song and go to the next one in the queue
+#[command]
+#[only_in(guilds)]
+async fn skip(
+    context: &Context,
+    message: &Message,
+    _args: Args,
+) -> CommandResult {
+    let guild_id = message.guild_id.unwrap();
+
+    let manager = songbird::get(context)
+        .await
+        .expect("Songbird Voice client placed in at initialisation.")
+        .clone();
+
+    if let Some(handler_lock) = manager.get(guild_id) {
+        let handler = handler_lock.lock().await;
+        let queue = handler.queue();
+        let _ = queue.skip();
+
+        let answer = match queue.len() {
+            0 => "Skipping current song. The queue is now empty.",
+            _ => "Skipping current song"
+        }.to_string();
+
+        check_msg(message.channel_id.say(
+            &context.http,
+            answer,
+        ).await);
+    }
+
+    Ok(())
+}
+
+/// stop the current song and clear the queue
+#[command]
+#[only_in(guilds)]
+async fn stop(
+    context: &Context,
+    message: &Message,
+    _args: Args,
+) -> CommandResult {
+    let guild_id = message.guild_id.unwrap();
+
+    let manager = songbird::get(context)
+        .await
+        .expect("Songbird Voice client placed in at initialisation.")
+        .clone();
+
+    if let Some(handler_lock) = manager.get(guild_id) {
+        let handler = handler_lock.lock().await;
+        let queue = handler.queue();
+        let _ = queue.stop();
+
+        check_msg(message.channel_id.say(
+            &context.http,
+            "Current song stopped and queue cleared.".to_string(),
+        ).await);
+    }
+
+    Ok(())
+}
+
+/// display a help message
+#[command]
+#[only_in(guilds)]
+async fn help(
+    context: &Context,
+    message: &Message,
+    _args: Args,
+) -> CommandResult {
+    let mut help_message = String::new();
+    help_message += "!help = show this message";
+    help_message += "\n";
+    help_message += "!play <YouTube URL> = add the given Youtube link to the queue";
+    help_message += "\n";
+    help_message += "!skip = skip the currently playing song and go to the next one in the queue";
+    help_message += "\n";
+    help_message += "!stop = stop the current song and clear the queue";
+
+    check_msg(message.channel_id.say(&context.http, help_message).await);
     Ok(())
 }
 
