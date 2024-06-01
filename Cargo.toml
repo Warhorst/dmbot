@@ -6,7 +6,7 @@ edition = "2021"
 # discord bot framework
 [dependencies.serenity]
 version = "0.12.1"
-features = ["cache", "framework", "standard_framework", "voice"]
+features = ["cache", "framework", "standard_framework", "voice", "rustls_backend"]
 
 # extention for serenity to enable voice (and more important: ytdl support); requires cmake on the system
 [dependencies.songbird]
