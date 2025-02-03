@@ -20,9 +20,14 @@ features = ["aac", "mp3", "isomp4", "alac"]
 # async framework, because every fucking library needs to be async now
 [dependencies]
 tokio = { version = "1.21.2", features = ["macros", "rt-multi-thread"] }
+itertools = "0.14.0"
 
 # disables openssl, because this software can burn in hell
 [dependencies.reqwest]
 version = "0.11"
 default-features = false
 features = ["rustls-tls"]
+
+[dependencies.rusqlite]
+version = "0.33.0"
+features = ["bundled"]

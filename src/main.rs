@@ -1,14 +1,19 @@
-use std::env;
+mod database;
+mod ytdlp;
 
 use reqwest::Client as HttpClient;
 use serenity::all::*;
 use serenity::async_trait;
-use serenity::framework::standard::{Args, CommandResult, Configuration};
 use serenity::framework::standard::macros::{command, group};
+use serenity::framework::standard::{Args, CommandResult, Configuration};
 use serenity::prelude::*;
-use songbird::{EventContext, SerenityInit, TrackEvent};
 use songbird::input::{Compose, YoutubeDl};
-
+use songbird::{EventContext, SerenityInit, TrackEvent};
+use std::env;
+use std::sync::Arc;
+use itertools::Itertools;
+use crate::database::Database;
+use crate::ytdlp::get_video_name;
 // see https://github.com/serenity-rs/serenity/blob/current/examples/e01_basic_ping_bot/src/main.rs
 // see https://github.com/serenity-rs/songbird/blob/current/examples/serenity/voice/src/main.rs
 
@@ -26,6 +31,7 @@ async fn main() {
         .framework(framework)
         .register_songbird()
         .type_map_insert::<HttpKey>(HttpClient::new())
+        .type_map_insert::<DbKey>(Arc::new(Mutex::new(Database::open())))
         .await
         .expect("Err creating client");
 
@@ -39,6 +45,12 @@ struct HttpKey;
 
 impl TypeMapKey for HttpKey {
     type Value = HttpClient;
+}
+
+struct DbKey;
+
+impl TypeMapKey for DbKey {
+    type Value = Arc<Mutex<Database>>;
 }
 
 struct Handler;
@@ -73,7 +85,7 @@ impl songbird::events::EventHandler for TrackErrorNotifier {
 
 /// All commands the bot supports
 #[group]
-#[commands(play, skip, stop, help)]
+#[commands(play, reg, skip, stop, help)]
 struct DMBot;
 
 /// Main command which is used to join a channel and play some music from YouTube.
@@ -84,18 +96,7 @@ async fn play(
     message: &Message,
     mut args: Args,
 ) -> CommandResult {
-    let url = match args.single::<String>() {
-        Ok(url) => url,
-        Err(_) => {
-            check_msg(
-                message.channel_id
-                    .say(&context.http, "Must provide a URL to a video or audio")
-                    .await,
-            );
-
-            return Ok(());
-        }
-    };
+    let input = args.iter::<String>().map(|r| r.unwrap()).collect::<Vec<_>>().join(" ");
 
     let (guild_id, channel_id) = get_guild_and_voice_channel(context, message);
     let connect_to = match channel_id {
@@ -124,8 +125,35 @@ async fn play(
             .expect("The HTTP client should exist in the type map.")
     };
 
+    let database = {
+        let data = context.data.read().await;
+        data.get::<DbKey>()
+            .cloned()
+            .expect("The database should exist in the type map")
+    };
+
     if let Some(handler_lock) = manager.get(guild_id) {
         let mut handler = handler_lock.lock().await;
+
+        let url = match input.starts_with("https") {
+            true => input,
+            false => {
+                let videos = database.lock().await.find_videos_like(input);
+
+                match videos.len() {
+                    0 => {
+                        check_msg(message.channel_id.say(&context.http, format!("No videos with a name like this exist")).await);
+                        return Ok(())
+                    },
+                    1 => format!("https://www.youtube.com/watch?v={}", videos.get(0).unwrap().clone().0),
+                    _ => {
+                        let videos_string = videos.iter().map(|(_, title)| title).join(", ");
+                        check_msg(message.channel_id.say(&context.http, format!("More than one video was found: {videos_string}. Be more specific")).await);
+                        return Ok(())
+                    }
+                }
+            }
+        };
 
         let mut src = YoutubeDl::new(http_client, url);
         let _ = handler.enqueue_input(src.clone().into()).await;
@@ -141,6 +169,57 @@ async fn play(
                 .await,
         );
     }
+
+    Ok(())
+}
+
+/// Used to register a song by storing its YouTube id and name in the dmbot database.
+#[command]
+#[only_in(guilds)]
+async fn reg(
+    context: &Context,
+    message: &Message,
+    mut args: Args,
+) -> CommandResult {
+    let url = match args.single::<String>() {
+        Ok(url) => url,
+        Err(_) => {
+            check_msg(
+                message.channel_id
+                    .say(&context.http, "Must provide a URL to a video or audio")
+                    .await,
+            );
+
+            return Ok(());
+        }
+    };
+
+    let title = match get_video_name(&url) {
+        Ok(title) => title,
+        Err(e) => {
+            check_msg(message.channel_id.say(&context.http, format!("Could not retrieve video name. {e}")).await);
+            return Ok(())
+        }
+    };
+
+    let database = {
+        let data = context.data.read().await;
+        data.get::<DbKey>()
+            .cloned()
+            .expect("The database should exist in the type map")
+    };
+
+    let raw_id = {
+        let mut id = url.replace("https://www.youtube.com/watch?v=", "");
+        id.split("&").next().unwrap().into()
+    };
+
+    if let Err(e) = database.lock().await.add_song(raw_id, title) {
+        check_msg(message.channel_id.say(&context.http, format!("Could not store video in database. {e}")).await);
+        return Ok(())
+    }
+
+    check_msg(message.channel_id.say(&context.http, "Video registered in database.").await);
 
     Ok(())
 }
